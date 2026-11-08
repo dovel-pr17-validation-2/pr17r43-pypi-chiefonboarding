@@ -1,0 +1,109 @@
+def _tokenize_notation(notation):
+    # split on '.' but keep [...] groups intact, so values inside a filter
+    # expression (which may themselves contain '.', e.g. emails) aren't split
+    tokens = []
+    buf = ""
+    depth = 0
+    for ch in notation:
+        if ch == "[":
+            depth += 1
+            buf += ch
+        elif ch == "]":
+            depth -= 1
+            buf += ch
+        elif ch == "." and depth == 0:
+            if buf:
+                tokens.append(buf)
+                buf = ""
+        else:
+            buf += ch
+    if buf:
+        tokens.append(buf)
+    return tokens
+
+
+def get_value_from_notation(notation, value):
+    # if we don't need to go into props, then just return the value
+    if notation == "":
+        return value
+
+    for token in _tokenize_notation(notation):
+        # filter form: optional_key[field=expected] - pick first list entry
+        # whose `field` equals `expected`. Useful when the upstream API returns
+        # an unfiltered list (e.g. Bitwarden /public/members).
+        if "[" in token and token.endswith("]"):
+            list_key, _, filter_expr = token.partition("[")
+            filter_expr = filter_expr[:-1]
+
+            if list_key:
+                try:
+                    value = value[list_key]
+                except (KeyError, TypeError):
+                    raise KeyError
+
+            if "=" not in filter_expr or not isinstance(value, list):
+                raise KeyError
+
+            field, _, expected = filter_expr.partition("=")
+            # field may be a dotted path (e.g. attributes.email) for APIs
+            # that nest values under attributes, like HackerOne / JSON:API.
+            # Single-segment paths preserve the original top-level behavior.
+            field_path = field.split(".")
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                candidate = item
+                for part in field_path:
+                    if isinstance(candidate, dict) and part in candidate:
+                        candidate = candidate[part]
+                    else:
+                        candidate = None
+                        break
+                if candidate is not None and str(candidate) == expected:
+                    value = item
+                    break
+            else:
+                raise KeyError
+            continue
+
+        try:
+            value = value[token]
+        except TypeError:
+            if not isinstance(value, list):
+                raise KeyError
+
+            try:
+                index = int(token)
+            except (TypeError, ValueError):
+                raise KeyError
+
+            try:
+                value = value[index]
+            except (TypeError, ValueError, IndexError):
+                raise KeyError
+
+    return value
+
+
+def convert_array_to_object(arr):
+    return {item["key"]: item["value"] for item in arr}
+
+
+def convert_object_to_array(obj):
+    return [{"key": key, "value": value} for key, value in obj.items()]
+
+
+def prepare_initial_data(obj, keys=("headers",)):
+    """
+    Convert the dicts of the given keys to a list of key/value items, so they can be
+    used with the `ValueKeyArrayField` widget.
+    """
+    if not isinstance(obj, dict):
+        return obj
+
+    # Copy, so the original (often the integration manifest) is not changed
+    obj = {**obj}
+    for key in keys:
+        if isinstance(obj.get(key), dict):
+            obj[key] = convert_object_to_array(obj[key])
+    return obj

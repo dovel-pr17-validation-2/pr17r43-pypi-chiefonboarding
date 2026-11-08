@@ -1,0 +1,53 @@
+{% extends 'admin_base.html' %}
+{% load crispy_forms_tags %}
+{% load i18n %}
+
+{% block actions %}
+    {% if request.user.is_admin %}
+    <form method="post" action="{% url 'integrations:access-report-refresh' %}">
+      {% csrf_token %}
+      <button type="submit" class="btn">
+        {% translate "Refresh data" %}
+      </button>
+    </form>
+    {% endif %}
+    <a href="{% querystring format="csv" %}" class="btn btn-primary">{% translate "Download CSV" %}</a>
+{% endblock %}
+
+{% block content %}
+<div class="col-12">
+  <div class="card">
+    <div class="card-header">
+      <div class="row w-100">
+        <div class="col-12">
+          <div class="row">
+            {% crispy filter.form %}
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-vcenter table-nowrap">
+        <thead>
+          <tr>
+            <th style="position: sticky; left: 0; background: var(--tblr-card-bg, #fff); z-index: 2;">{% translate "User" %}</th>
+            {% for integration in integrations %}
+              <th>{{ integration.name }}</th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            {% include "_access_report_row.html" %}
+          {% empty %}
+          <tr>
+            <td colspan="{{ integrations|length|add:1 }}">{% translate "No users found" %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% include "_paginator.html" %}
+    </div>
+  </div>
+</div>
+{% endblock %}

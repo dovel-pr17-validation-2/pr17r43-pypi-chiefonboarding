@@ -1,0 +1,2304 @@
+import base64
+import json
+import re
+from datetime import timedelta
+from unittest.mock import Mock, patch
+
+import pytest
+import requests
+from django.contrib.auth import get_user_model
+from django.urls import reverse
+from django.utils import timezone
+from django_q.models import Schedule
+from freezegun import freeze_time
+
+from admin.integrations.models import (
+    Integration,
+    IntegrationTracker,
+    IntegrationTrackerStep,
+)
+from admin.integrations.sync_userinfo import SyncUsers
+from admin.integrations.utils import get_value_from_notation
+from organization.models import Notification
+from users.factories import IntegrationUserFactory
+from users.models import IntegrationUser
+
+
+@pytest.mark.django_db
+def test_create_integration(client, django_user_model):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+
+    url = reverse("integrations:create")
+    response = client.get(url)
+
+    assert "Add new integration" in response.content.decode()
+
+    # Post with invalid JSON
+    response = client.post(url, {"name": "test", "manifest": '{"test": "Test",}'})
+
+    assert "Enter a valid JSON." in response.content.decode()
+
+    # Post with valid JSON for webhook manifest
+    response = client.post(
+        url,
+        {
+            "name": "test",
+            "manifest": '{"form": [],"execute": []}',
+            "manifest_type": Integration.ManifestType.WEBHOOK,
+        },
+    )
+
+    assert "Enter a valid JSON." not in response.content.decode()
+    assert Integration.objects.filter(integration=Integration.Type.CUSTOM).count() == 1
+
+    # Post with valid JSON for manual provisioning
+    response = client.post(
+        url,
+        {
+            "name": "test",
+            "manifest_type": Integration.ManifestType.MANUAL_USER_PROVISIONING,
+        },
+    )
+
+    assert "Enter a valid JSON." not in response.content.decode()
+    assert Integration.objects.filter(integration=Integration.Type.CUSTOM).count() == 2
+
+
+@pytest.mark.django_db
+def test_create_update_sync_integration(client, django_user_model):
+    create_url = reverse("integrations:create")
+
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+
+    client.post(
+        create_url,
+        {
+            "name": "test",
+            "manifest": '{"action": "create","execute": [],"data_structure": {"first_name": "first_name" }}',  # noqa
+            "manifest_type": Integration.ManifestType.SYNC_USERS,
+        },
+    )
+
+    integration = Integration.objects.first()
+
+    update_url = reverse("integrations:update", args=[integration.id])
+
+    assert (
+        Integration.objects.filter(
+            manifest_type=Integration.ManifestType.SYNC_USERS
+        ).count()
+        == 1
+    )
+    schedule = Schedule.objects.filter(
+        name=f"User sync for integration: {integration.id}"
+    ).first()
+
+    # schedule is not there, since there was no schedule provided
+    assert schedule is None
+
+    # add schedule
+    client.post(
+        update_url,
+        {
+            "name": "test",
+            "manifest": '{"action": "create","execute": [],"data_structure": {"first_name": "first_name" }, "schedule": "* * * * *"}',  # noqa
+            "manifest_type": Integration.ManifestType.SYNC_USERS,
+        },
+    )
+
+    schedule = Schedule.objects.filter(
+        name=f"User sync for integration: {integration.id}"
+    ).first()
+    assert schedule is not None
+    assert schedule.cron == "* * * * *"
+
+    # remove schedule
+    client.post(
+        update_url,
+        {
+            "name": "test",
+            "manifest": '{"action": "create","execute": [],"data_structure": {"first_name": "first_name" }}',  # noqa
+            "manifest_type": Integration.ManifestType.SYNC_USERS,
+        },
+    )
+
+    schedule = Schedule.objects.filter(
+        name=f"User sync for integration: {integration.id}"
+    ).first()
+    assert schedule is None
+
+    # update to change cron
+    client.post(
+        update_url,
+        {
+            "name": "test",
+            "manifest": '{"action": "create","execute": [],"data_structure": {"first_name": "first_name" }, "schedule": "* 1 * * *"}',  # noqa
+            "manifest_type": Integration.ManifestType.SYNC_USERS,
+        },
+    )
+
+    schedule = Schedule.objects.filter(
+        name=f"User sync for integration: {integration.id}"
+    ).first()
+    assert schedule is not None
+    assert schedule.cron == "* 1 * * *"
+
+    # delete to test if schedule is gone
+    url = reverse("integrations:delete", args=[integration.id])
+    client.post(url, follow=True)
+
+    assert not Schedule.objects.filter(
+        name=f"User sync for integration: {integration.id}"
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_update_integration(client, django_user_model, custom_integration_factory):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory()
+
+    url = reverse("integrations:update", args=[integration.id])
+    response = client.get(url)
+
+    assert "Update existing integration" in response.content.decode()
+    assert "TEAM_ID" in response.content.decode()
+    assert integration.name in response.content.decode()
+
+    # add some extra_args data and make one item a secret value
+    new_manifest = json.loads(json.dumps(integration.manifest))
+    new_manifest["initial_data_form"][0]["secret"] = True
+    # delete the `TOKEN` one
+    del new_manifest["initial_data_form"][0]
+
+    integration.extra_args["TOKEN"] = "test"
+    integration.save()
+
+    response = client.post(
+        url,
+        data={
+            "manifest": json.dumps(new_manifest),
+            "name": "test",
+            "manifest_type": Integration.ManifestType.MANUAL_USER_PROVISIONING,
+        },
+        follow=True,
+    )
+    integration.refresh_from_db()
+    assert response.status_code == 200
+    assert integration.extra_args == {}
+
+
+@pytest.mark.django_db
+def test_delete_integration(client, django_user_model, custom_integration_factory):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory()
+
+    assert Integration.objects.filter(integration=Integration.Type.CUSTOM).count() == 1
+
+    url = reverse("integrations:delete", args=[integration.id])
+    response = client.get(url, follow=True)
+
+    assert (
+        "Are you sure you want to remove this integration?" in response.content.decode()
+    )
+
+    response = client.delete(url, follow=True)
+
+    assert reverse("settings:integrations") in response.redirect_chain[-1][0]
+    assert Integration.objects.filter(integration=Integration.Type.CUSTOM).count() == 0
+
+
+@pytest.mark.django_db
+def test_backfill_ids_view_not_admin(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.NEWHIRE)
+    )
+    integration = custom_integration_factory()
+
+    url = reverse("integrations:backfill-ids", args=[integration.id])
+    response = client.post(url, follow=True)
+
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_backfill_ids_view_unknown_integration(client, django_user_model):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+
+    url = reverse("integrations:backfill-ids", args=[999])
+    response = client.post(url, follow=True)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_backfill_ids_view_no_store_data(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    # default factory manifest has an `exists` block without `store_data`
+    integration = custom_integration_factory(
+        manifest={
+            "exists": {
+                "url": "http://localhost:8000/test",
+                "method": "GET",
+                "expected": "{{ email }}",
+            }
+        }
+    )
+    assert not integration.can_backfill_ids
+
+    url = reverse("integrations:backfill-ids", args=[integration.id])
+    with patch("admin.integrations.views.async_task") as mocked_async_task:
+        response = client.post(url, follow=True)
+
+    mocked_async_task.assert_not_called()
+    assert reverse("settings:integrations") in response.redirect_chain[-1][0]
+    assert (
+        "This integration has no store_data declared on its exists block."
+        in response.content.decode()
+    )
+
+
+@pytest.mark.django_db
+def test_backfill_ids_view_with_store_data(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={
+            "exists": {
+                "url": "http://localhost:8000/test",
+                "method": "GET",
+                "expected": "{{ email }}",
+                "store_data": {"external_id": "id"},
+            }
+        }
+    )
+    assert integration.can_backfill_ids
+
+    url = reverse("integrations:backfill-ids", args=[integration.id])
+    with patch("admin.integrations.views.async_task") as mocked_async_task:
+        response = client.post(url, follow=True)
+
+    mocked_async_task.assert_called_once_with(
+        "admin.integrations.tasks.backfill_integration_ids",
+        integration.id,
+        task_name=f"Backfill IDs: {integration.name}",
+    )
+    assert reverse("settings:integrations") in response.redirect_chain[-1][0]
+    assert f"Backfill started for {integration.name}." in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_integration_extra_args_form(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory()
+
+    url = reverse("integrations:update-creds", args=[integration.id])
+    response = client.get(url)
+
+    assert "Please put your token here" in response.content.decode()
+    assert "Organization id" in response.content.decode()
+    assert 'name="ORG"' in response.content.decode()
+    assert 'name="TOKEN"' in response.content.decode()
+    assert '"hidden" name="PASSWORD"' in response.content.decode()
+
+    response = client.post(
+        url, {"ORG": "123", "TOKEN": "SECRET_TOKEN", "NOTWORKING": "False"}, follow=True
+    )
+
+    integration = Integration.objects.first()
+    assert integration.extra_args["ORG"] == "123"
+    assert integration.extra_args["TOKEN"] == "SECRET_TOKEN"
+    assert "NOTWORKING" not in integration.extra_args
+
+    response = client.get(url)
+
+    # Value and token are shown on update page
+    assert "123" in response.content.decode()
+    assert "SECRET_TOKEN" in response.content.decode()
+
+    # make token hidden through secret
+    integration.manifest["initial_data_form"][0]["secret"] = True
+    integration.save()
+
+    # not on page anymore
+    response = client.get(url)
+    assert "SECRET_TOKEN" not in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_integration_remove_extra_args_form(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory()
+    integration.manifest["initial_data_form"][0]["secret"] = True
+    integration.extra_args["TOKEN"] = "test"
+    integration.save()
+
+    url = reverse("integrations:delete-creds", args=[integration.id, "token"])
+    response = client.post(url, follow=True)
+
+    # raise 404 as 'token' is incorrect
+    assert response.status_code == 404
+
+    url = reverse("integrations:delete-creds", args=[integration.id, "TOKEN"])
+    response = client.post(url, follow=True)
+
+    # remove url is gone and value has been cleared
+    assert response.status_code == 200
+    assert url not in response.content.decode()
+    integration.refresh_from_db()
+    assert integration.extra_args.get("token", None) is None
+
+
+@pytest.mark.django_db
+def test_integration_request_exceptions_invalid_url(custom_integration_factory):
+    integration = custom_integration_factory(
+        manifest={
+            "oauth": {
+                "access_token": {"url": "http://localhost:8000/test/"},
+                "authenticate_url": "http://localhost:8000/test/",
+            },
+            "headers": {},
+        }
+    )
+
+    success, result = integration.run_request(
+        {"method": "POST", "url": "//localhost:8000/test/", "cast_data_to_json": False}
+    )
+
+    assert not success
+    assert result == "The url is invalid"
+
+
+@pytest.mark.django_db
+def test_integration_request_basic_auth(custom_integration_factory):
+    integration = custom_integration_factory(
+        manifest={
+            "headers": {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": "Basic {{ADMIN_EMAIL}}:{{TOKEN}}",
+            },
+            "initial_data_form": [
+                {
+                    "id": "ADMIN_EMAIL",
+                    "name": "The admin email here with which the token was generated.",
+                    "description": "",
+                },
+                {"id": "TOKEN", "name": "The token", "description": ""},
+            ],
+        }
+    )
+
+    integration.params = {"ADMIN_EMAIL": "test@chiefonboarding.com", "TOKEN": "123"}
+    assert (
+        base64.b64encode("test@chiefonboarding.com:123".encode("ascii")).decode("ascii")
+        == "dGVzdEBjaGllZm9uYm9hcmRpbmcuY29tOjEyMw=="
+    )
+    assert integration.headers() == {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": "Basic dGVzdEBjaGllZm9uYm9hcmRpbmcuY29tOjEyMw==",
+    }
+
+
+@pytest.mark.django_db
+def test_integration_pritunl_missing_credentials(custom_integration_factory):
+    integration = custom_integration_factory(
+        manifest={
+            "oauth": {
+                "access_token": {"url": "http://localhost:8000/test/"},
+                "authenticate_url": "http://localhost:8000/test/",
+            },
+            "headers": {},
+        }
+    )
+
+    success, result = integration.run_request(
+        {
+            "method": "POST",
+            "url": "http://localhost:8000/test/",
+            "extra_headers": "pritunl",
+        }
+    )
+
+    assert not success
+    assert result == "Missing API_TOKEN/API_SECRET (or legacy PRITUNL_API_* keys)"
+
+
+@pytest.mark.django_db
+@freeze_time("2021-01-12")
+@patch(
+    "admin.integrations.models.requests.request",
+    Mock(return_value=Mock(status_code=200, json=lambda: dict({}))),
+)
+@patch(
+    "admin.integrations.helpers.pritunl.uuid.uuid4",
+    Mock(return_value=Mock(hex="uuid-hex-value")),
+)
+def test_integration_pritunl_happy_path(custom_integration_factory):
+    integration = custom_integration_factory(
+        manifest={
+            "oauth": {
+                "access_token": {"url": "http://localhost:8000/test/"},
+                "authenticate_url": "http://localhost:8000/test/",
+            },
+            "headers": {},
+        }
+    )
+    integration.extra_args = {"API_TOKEN": "test", "API_SECRET": "test"}
+    integration.tracker = IntegrationTracker.objects.create(
+        integration=integration, category=IntegrationTracker.Category.EXECUTE
+    )
+
+    success, _ = integration.run_request(
+        {
+            "method": "POST",
+            "url": "http://localhost:8000/test/",
+            "extra_headers": "pritunl",
+        }
+    )
+
+    assert success
+    assert IntegrationTrackerStep.objects.last().headers == {
+        "Auth-Nonce": "uuid-hex-value",
+        "Auth-Token": "***Secret value for API_TOKEN***",
+        "Auth-Signature": "55w8U79nZxF2Aj40bMkUXOSz5MZWHWqfCP6y8VbJU5M=",
+        "Auth-Timestamp": "1610409600",
+    }
+
+
+@pytest.mark.django_db
+def test_integration_oauth_redirect_view(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={"oauth": {"authenticate_url": "http://localhost:8000/test/{{TEST}}"}},
+        extra_args={"TEST": "HI"},
+    )
+
+    url = reverse("integrations:oauth", args=[integration.id])
+    response = client.get(url, follow=True)
+
+    last_url, status_code = response.redirect_chain[-1]
+
+    assert status_code == 302
+    assert last_url == "http://localhost:8000/test/HI"
+
+    integration.enabled_oauth = True
+    integration.save()
+
+    response = client.get(url, follow=True)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_integration_user_exists(
+    client,
+    django_user_model,
+    new_hire_factory,
+    custom_integration_factory,
+    manual_user_provision_integration_factory,
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={
+            "exists": {
+                "url": "http://localhost:8000/test",
+                "method": "GET",
+                "expected": "{{ email}}",
+            }
+        }
+    )
+    new_hire = new_hire_factory()
+
+    # Didn't find user
+    with patch(
+        "admin.integrations.models.requests.request",
+        Mock(return_value=Mock(status_code=200, json=lambda: [{"error": "not_found"}])),
+    ):
+        exists = integration.user_exists(new_hire)
+        assert IntegrationUser.objects.filter(
+            user=new_hire, integration=integration, revoked=True
+        ).exists()
+        assert not exists
+
+    # Found user
+    with patch(
+        "admin.integrations.models.requests.request",
+        Mock(
+            return_value=Mock(status_code=200, json=lambda: [{"user": new_hire.email}])
+        ),
+    ):
+        exists = integration.user_exists(new_hire)
+        assert IntegrationUser.objects.filter(
+            user=new_hire, integration=integration, revoked=False
+        ).exists()
+        assert exists
+
+    # Error went wrong
+    with patch(
+        "admin.integrations.models.requests.request",
+        side_effect=requests.exceptions.Timeout,
+    ):
+        exists = integration.user_exists(new_hire)
+        assert exists is None
+
+    manual_integration = manual_user_provision_integration_factory()
+
+    # Does not exist yet, because manual user provision user obj does not exist
+    assert not manual_integration.user_exists(new_hire)
+
+    # Create user integration, so this will show up as exist
+    integration_user = IntegrationUserFactory(
+        user=new_hire, integration=manual_integration
+    )
+
+    assert manual_integration.user_exists(new_hire)
+
+    # Set as revoked, so it doesn't exist anymore
+    integration_user.revoked = True
+    integration_user.save()
+
+    assert not manual_integration.user_exists(new_hire)
+
+
+@pytest.mark.django_db
+def test_integration_user_exists_store_data(
+    new_hire_factory, custom_integration_factory
+):
+    integration = custom_integration_factory(
+        manifest={
+            "exists": {
+                "url": "http://localhost:8000/test",
+                "method": "GET",
+                "expected": "{{ email }}",
+                "store_data": {
+                    "external_id": "user.id",
+                    "missing_field": "user.does_not_exist",
+                    "null_field": "user.nothing_here",
+                },
+            }
+        }
+    )
+    new_hire = new_hire_factory(extra_fields={"existing": "keepme"})
+
+    # User found: matching store_data notations get written to extra_fields,
+    # a notation that doesn't resolve is skipped, a resolved-to-None value is
+    # skipped, and pre-existing extra_fields are left untouched.
+    with patch(
+        "admin.integrations.models.requests.request",
+        Mock(
+            return_value=Mock(
+                status_code=200,
+                json=lambda: {
+                    "user": {
+                        "email": new_hire.email,
+                        "id": "abc123",
+                        "nothing_here": None,
+                    }
+                },
+            )
+        ),
+    ):
+        exists = integration.user_exists(new_hire)
+
+    assert exists
+    new_hire.refresh_from_db()
+    assert new_hire.extra_fields == {"existing": "keepme", "external_id": "abc123"}
+
+
+@pytest.mark.django_db
+def test_integration_user_exists_store_data_user_not_found(
+    new_hire_factory, custom_integration_factory
+):
+    integration = custom_integration_factory(
+        manifest={
+            "exists": {
+                "url": "http://localhost:8000/test",
+                "method": "GET",
+                "expected": "{{ email }}",
+                "store_data": {"external_id": "user.id"},
+            }
+        }
+    )
+    new_hire = new_hire_factory(extra_fields={})
+
+    # User not found: store_data is declared, but since the user wasn't
+    # found, nothing should get written to extra_fields.
+    with patch(
+        "admin.integrations.models.requests.request",
+        Mock(
+            return_value=Mock(
+                status_code=200,
+                json=lambda: {"user": {"email": "someone-else@chiefonboarding.com"}},
+            )
+        ),
+    ):
+        exists = integration.user_exists(new_hire)
+
+    assert not exists
+    new_hire.refresh_from_db()
+    assert new_hire.extra_fields == {}
+
+
+@pytest.mark.django_db
+def test_integration_user_exists_store_data_invalid_json_response(
+    new_hire_factory, custom_integration_factory
+):
+    integration = custom_integration_factory(
+        manifest={
+            "exists": {
+                "url": "http://localhost:8000/test",
+                "method": "GET",
+                "expected": "{{ email }}",
+                "store_data": {"external_id": "user.id"},
+            }
+        }
+    )
+    new_hire = new_hire_factory(extra_fields={})
+
+    # User found, but the response body isn't valid JSON: json_response
+    # falls back to {}, so every store_data lookup gets a KeyError and is
+    # skipped, without the view raising.
+    with patch(
+        "admin.integrations.models.requests.request",
+        Mock(
+            return_value=Mock(
+                status_code=200,
+                json=Mock(side_effect=ValueError),
+                text=new_hire.email,
+            )
+        ),
+    ):
+        exists = integration.user_exists(new_hire)
+
+    assert exists
+    new_hire.refresh_from_db()
+    assert new_hire.extra_fields == {}
+
+
+@pytest.mark.django_db
+def test_integration_needs_user_info(
+    new_hire_factory,
+    custom_integration_factory,
+    manual_user_provision_integration_factory,
+):
+    # No form and no extra user info, so we could create an account with extra info
+    new_hire = new_hire_factory()
+    integration = custom_integration_factory(
+        manifest={"form": [], "extra_user_info": []}
+    )
+    assert not integration.needs_user_info(new_hire)
+
+    # Need TEAM_ID, so we need user info
+    integration.manifest = {
+        "form": [
+            {
+                "id": "TEAM_ID",
+                "name": "Select team to add user to",
+                "type": "input",
+            }
+        ],
+        "extra_user_info": [],
+    }
+    integration.save()
+    assert integration.needs_user_info(new_hire)
+
+    # Needs extra user info from manifest, so we need user info
+    integration.manifest = {
+        "form": [],
+        "extra_user_info": [
+            {
+                "id": "PERSONAL_EMAIL",
+                "name": "Personal email address",
+                "description": "",
+            }
+        ],
+    }
+    integration.save()
+    assert integration.needs_user_info(new_hire)
+
+    # Add field to new hire (previously filled in)
+    new_hire.extra_fields["PERSONAL_EMAIL"] = "test@test.com"
+    new_hire.save()
+
+    # All info filled, so no need for extra info
+    new_hire.refresh_from_db()
+    assert not integration.needs_user_info(new_hire)
+
+    # manual integration never needs more info
+    manual_integration = manual_user_provision_integration_factory()
+    assert not manual_integration.needs_user_info(new_hire)
+
+
+@pytest.mark.django_db
+def test_integration_revoke_user(
+    client,
+    django_user_model,
+    new_hire_factory,
+    custom_integration_factory,
+    manual_user_provision_integration_factory,
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={
+            "exists": {
+                "url": "http://localhost:8000/test",
+                "method": "GET",
+                "expected": "{{ email}}",
+            },
+            "revoke": [{"url": "http://localhost:8000/test", "method": "POST"}],
+        }
+    )
+    new_hire = new_hire_factory()
+
+    # Revoke user successfully
+    with patch(
+        "admin.integrations.models.requests.request",
+        Mock(return_value=Mock(status_code=200, json=lambda: [])),
+    ):
+        success, error = integration.revoke_user(new_hire)
+        assert success
+        assert error == ""
+
+    # Revoke user unsuccessfully
+    with patch(
+        "admin.integrations.models.requests.request",
+        side_effect=requests.exceptions.Timeout,
+    ):
+        success, error = integration.revoke_user(new_hire)
+        assert not success
+        assert "Something went wrong"
+
+    # try the same with a manual integration, this doesn't work as it can't actually
+    # revoke a user
+    manual_integration = manual_user_provision_integration_factory()
+    success, error = manual_integration.revoke_user(new_hire)
+    assert not success
+    assert error == "Cannot revoke manual integration"
+
+
+@pytest.mark.django_db
+def test_integration_refresh_token(
+    client, django_user_model, new_hire_factory, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={
+            "oauth": {
+                "refresh": {"url": "http://localhost:8000/test", "method": "GET"}
+            },
+            "initial_data_form": [],
+            "execute": [],
+        },
+        extra_args={
+            "oauth": {
+                "expires_in": 500,
+            }
+        },
+        expiring=timezone.now() - timedelta(days=1),
+    )
+    new_hire = new_hire_factory()
+
+    # This one fails as it couldn't fetch the new token
+    with patch(
+        "admin.integrations.models.Integration.run_request",
+        Mock(return_value=(False, Mock(text="[{'error': 'not_found'}]"))),
+    ):
+        integration.new_hire = new_hire
+        integration.has_user_context = True
+        integration.renew_key()
+
+        assert (
+            Notification.objects.filter(
+                notification_type=Notification.Type.FAILED_INTEGRATION
+            ).count()
+            == 1
+        )
+
+    # This one fails as it couldn't fetch the new token
+    with patch(
+        "admin.integrations.models.Integration.run_request",
+        Mock(
+            return_value=(
+                True,
+                Mock(json=lambda: {"access_token": "xxx", "expires_in": 1234}),
+            )
+        ),
+    ):
+        integration.new_hire = new_hire
+        integration.renew_key()
+
+        integration.refresh_from_db()
+        assert integration.extra_args["oauth"] == {
+            "access_token": "xxx",
+            "expires_in": 1234,
+        }
+        # Only one because of previous request
+        assert (
+            Notification.objects.filter(
+                notification_type=Notification.Type.FAILED_INTEGRATION
+            ).count()
+            == 1
+        )
+
+
+@pytest.mark.django_db
+def test_integration_send_email(
+    client, django_user_model, new_hire_factory, mailoutbox, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={
+            "oauth": {},
+            "initial_data_form": [{"id": "PASSWORD", "name": "generate"}],
+            "execute": [],
+            "post_execute_notification": [
+                {
+                    "type": "email",
+                    "subject": "Welcome {{first_name}}",
+                    "message": "Here is your password: {{PASSWORD}}",
+                    "to": "{{email}}",
+                }
+            ],
+        },
+        expiring=timezone.now() - timedelta(days=1),
+    )
+    new_hire = new_hire_factory()
+    integration.execute(new_hire, {})
+
+    assert len(mailoutbox) == 1
+    assert mailoutbox[0].subject == f"Welcome {new_hire.first_name}"
+    assert len(mailoutbox[0].to) == 1
+    assert mailoutbox[0].to[0] == new_hire.email
+    assert "Here is your password:" in mailoutbox[0].body
+    assert "{{PASSWORD}}" not in mailoutbox[0].body
+
+
+@pytest.mark.django_db
+def test_integration_oauth_callback_redirect_view_disabled_when_done(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={"oauth": {"authenticate_url": "http://localhost:8000/test/"}},
+        enabled_oauth=True,
+    )
+
+    url = reverse("integrations:oauth-callback", args=[integration.id])
+    response = client.get(url, follow=True)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_integration_oauth_callback_view_redirect_without_code(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={"oauth": {"authenticate_url": "http://localhost:8000/test/"}}
+    )
+
+    url = reverse("integrations:oauth-callback", args=[integration.id])
+    response = client.get(url, follow=True)
+
+    assert "Code was not provided" in response.content.decode()
+
+
+@pytest.mark.django_db
+@patch(
+    "admin.integrations.models.Integration.run_request",
+    Mock(return_value=(True, Mock(json=lambda: {"access_token": "test"}))),
+)
+def test_integration_oauth_callback_view(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={
+            "oauth": {
+                "access_token": {"url": "http://localhost:8000/test/"},
+                "authenticate_url": "http://localhost:8000/test/",
+            }
+        }
+    )
+
+    url = reverse("integrations:oauth-callback", args=[integration.id])
+    client.get(url + "?code=test", follow=True)
+
+    integration.refresh_from_db()
+    assert integration.enabled_oauth
+    assert integration.extra_args["oauth"] == {"access_token": "test"}
+
+
+@pytest.mark.django_db
+def test_integration_clean_error_data(custom_integration_factory):
+    integration = custom_integration_factory(
+        extra_args={
+            "SECRET_KEY": "123",
+        }
+    )
+    assert (
+        integration.clean_response("test 123 error")
+        == "test ***Secret value for SECRET_KEY*** error"
+    )
+
+
+@pytest.mark.django_db
+# Returns text instead of request object
+@patch(
+    "admin.integrations.models.Integration.run_request",
+    Mock(return_value=(False, '{"details": "failed_auth"}')),
+)
+def test_integration_oauth_callback_failed_view(
+    client, django_user_model, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={
+            "oauth": {
+                "access_token": {"url": "http://localhost:8000/test/?key=123"},
+                "authenticate_url": "http://localhost:8000/test/",
+            }
+        }
+    )
+
+    url = reverse("integrations:oauth-callback", args=[integration.id])
+    response = client.get(url + "?code=test", follow=True)
+
+    integration.refresh_from_db()
+    assert not integration.enabled_oauth
+    assert integration.extra_args == {}
+    assert (
+        "Couldn&#x27;t save token: {&quot;details&quot;: &quot;failed_auth&quot;}"
+        in response.content.decode()
+    )
+
+
+@pytest.mark.django_db
+@patch(
+    "requests.get",
+    Mock(
+        return_value=Mock(
+            status_code=200,
+            text='{"access_token":"vgn", "ok": true, "bot_user_id":"bot"}',
+        )
+    ),
+)
+def test_slack_connect(client, django_user_model):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    # Google login is disabled, so url doesn't work
+    url = reverse("integrations:slack")
+    response = client.get(url, follow=True)
+
+    # No code available
+    assert response.status_code == 200
+    assert "Could not optain slack authentication code." in response.content.decode()
+
+    response = client.get(url + "?code=test", follow=True)
+
+    assert response.status_code == 200
+
+    assert Integration.objects.filter(integration=Integration.Type.SLACK_BOT).exists()
+    assert "Slack has successfully been connected." in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_get_value_from_notation():
+    # test deep lookup through dictionaries
+    test_data = {"one": {"0": {"deep": "yes"}}}
+
+    # the 0 gets used as a prop
+    result = get_value_from_notation("one.0.deep", test_data)
+    assert result == "yes"
+
+    # test lookup with array inbetween
+    test_data = {"one": [{"deep": "yes"}]}
+
+    # the 0 gets used as the index for the array
+    result = get_value_from_notation("one.0.deep", test_data)
+    assert result == "yes"
+
+    # test invalid lookup with array inbetween
+    test_data = {"one": [{"deep": "yes"}]}
+
+    # the 1 gets used as the index for the array, but we don't have it, so raise error
+    with pytest.raises(KeyError):
+        get_value_from_notation("one.1.deep", test_data)
+
+    # test normal invalid lookup
+    test_data = {"one": "yes"}
+    with pytest.raises(KeyError):
+        get_value_from_notation("two", test_data)
+
+    # filter syntax: top-level field (existing behavior, must keep working)
+    test_data = {
+        "data": [
+            {"id": "A", "email": "a@x.com"},
+            {"id": "B", "email": "b@x.com"},
+        ]
+    }
+    assert get_value_from_notation("data[email=b@x.com].id", test_data) == "B"
+
+    # filter syntax: nested field via dotted path (new behavior)
+    test_data = {
+        "data": [
+            {"id": "1", "attributes": {"email": "a@x.com"}},
+            {"id": "2", "attributes": {"email": "b@x.com"}},
+        ]
+    }
+    assert (
+        get_value_from_notation("data[attributes.email=b@x.com].id", test_data) == "2"
+    )
+
+    # filter syntax: nested miss raises KeyError, same as top-level miss
+    with pytest.raises(KeyError):
+        get_value_from_notation("data[attributes.email=nope@x.com].id", test_data)
+
+    # filter syntax: dotted path that doesn't exist on items raises KeyError
+    test_data = {"data": [{"id": "1", "attributes": {"email": "a@x.com"}}]}
+    with pytest.raises(KeyError):
+        get_value_from_notation("data[attributes.missing=a@x.com].id", test_data)
+
+
+@pytest.mark.django_db
+def test_get_value_from_notation_empty_notation():
+    # an empty notation just returns the value as is, no lookup happens
+    test_data = {"one": "yes"}
+    assert get_value_from_notation("", test_data) == test_data
+    assert get_value_from_notation("", "just a string") == "just a string"
+
+
+@pytest.mark.django_db
+def test_get_value_from_notation_filter_expression():
+    # filter form: key[field=expected] picks the first list entry whose
+    # `field` matches `expected` (used for unfiltered list responses)
+    test_data = {
+        "members": [
+            {"email": "a@example.com", "name": "A"},
+            {"email": "b@example.com", "name": "B"},
+        ]
+    }
+
+    result = get_value_from_notation("members[email=b@example.com]", test_data)
+    assert result == {"email": "b@example.com", "name": "B"}
+
+    # notation can continue after the filter to dig into the matched item
+    result = get_value_from_notation("members[email=b@example.com].name", test_data)
+    assert result == "B"
+
+    # the expected value may itself contain dots (e.g. emails) - the
+    # tokenizer must not split on '.' while inside the [...] group
+    result = get_value_from_notation("members[email=a@example.com]", test_data)
+    assert result == {"email": "a@example.com", "name": "A"}
+
+    # non-dict items in the list are simply skipped, not fatal
+    test_data = {"members": ["not-a-dict", {"email": "b@example.com", "name": "B"}]}
+    result = get_value_from_notation("members[email=b@example.com]", test_data)
+    assert result == {"email": "b@example.com", "name": "B"}
+
+
+@pytest.mark.django_db
+def test_get_value_from_notation_filter_expression_without_list_key():
+    # filter form without a leading key, e.g. "[field=expected]", filters
+    # the current value directly instead of first looking up a sub-key
+    test_data = [{"field": "a"}, {"field": "b"}]
+
+    result = get_value_from_notation("[field=b]", test_data)
+    assert result == {"field": "b"}
+
+
+@pytest.mark.django_db
+def test_get_value_from_notation_filter_expression_no_match_raises():
+    # no item in the list matches the filter expression
+    test_data = {"members": [{"email": "a@example.com"}]}
+    with pytest.raises(KeyError):
+        get_value_from_notation("members[email=nomatch@example.com]", test_data)
+
+
+@pytest.mark.django_db
+def test_get_value_from_notation_filter_expression_missing_equals_raises():
+    # filter expression without "=" is invalid
+    test_data = {"members": [{"email": "a@example.com"}]}
+    with pytest.raises(KeyError):
+        get_value_from_notation("members[nofilter]", test_data)
+
+
+@pytest.mark.django_db
+def test_get_value_from_notation_filter_expression_not_a_list_raises():
+    # the value being filtered has to be a list
+    test_data = {"members": {"email": "a@example.com"}}
+    with pytest.raises(KeyError):
+        get_value_from_notation("members[email=a@example.com]", test_data)
+
+
+@pytest.mark.django_db
+def test_get_value_from_notation_filter_expression_missing_list_key_raises():
+    # the key before the filter expression doesn't exist on the value
+    test_data = {"members": [{"email": "a@example.com"}]}
+    with pytest.raises(KeyError):
+        get_value_from_notation("missing[email=a@example.com]", test_data)
+
+
+@pytest.mark.django_db
+def test_get_value_from_notation_non_integer_index_raises():
+    # indexing into a list with a token that isn't a valid integer
+    test_data = {"one": [{"deep": "yes"}]}
+    with pytest.raises(KeyError):
+        get_value_from_notation("one.notanumber", test_data)
+
+
+@pytest.mark.django_db
+@patch(
+    "admin.integrations.models.Integration.run_request",
+    Mock(return_value=(True, Mock(json=lambda: {"user_data": {"user_id": 123}}))),
+)
+def test_integration_save_data_to_user(new_hire_factory, custom_integration_factory):
+    new_hire = new_hire_factory()
+
+    assert new_hire.extra_fields == {}
+
+    integration = custom_integration_factory(
+        manifest={
+            "execute": [
+                {
+                    "url": "http://localhost/",
+                    "store_data": {"FORM_ID": "user_data.user_id"},
+                }
+            ]
+        }
+    )
+
+    integration.execute(new_hire, {})
+
+    new_hire.refresh_from_db()
+
+    assert new_hire.extra_fields == {"FORM_ID": 123}
+
+
+@pytest.mark.django_db
+@patch(
+    "admin.integrations.models.Integration.run_request",
+    Mock(return_value=(True, Mock(json=lambda: {"user": {"user_id": 123}}))),
+)
+def test_integration_save_data_to_user_invalid_lookup(
+    new_hire_factory, custom_integration_factory
+):
+    new_hire = new_hire_factory()
+
+    assert new_hire.extra_fields == {}
+
+    integration = custom_integration_factory(
+        manifest={
+            "execute": [
+                {
+                    "url": "http://localhost/",
+                    "store_data": {"FORM_ID": "user_data.user_id"},
+                }
+            ]
+        }
+    )
+
+    result = integration.execute(new_hire, {})
+
+    assert result == (
+        False,
+        "Could not store data to new hire: "
+        'user_data.user_id not found in {"user": {"user_id": 123}}',
+    )
+
+    new_hire.refresh_from_db()
+
+    assert new_hire.extra_fields == {}
+
+
+@pytest.mark.django_db
+def test_polling_not_getting_correct_state(
+    new_hire_factory, custom_integration_factory
+):
+    new_hire = new_hire_factory()
+
+    integration = custom_integration_factory(
+        manifest={
+            "execute": [
+                {
+                    "url": "http://localhost/",
+                    "polling": {
+                        # very small number to not let task hang too long
+                        "interval": 0.1,
+                        "amount": 3,
+                    },
+                    "continue_if": {
+                        "response_notation": "status",
+                        "value": "done",
+                    },
+                }
+            ]
+        }
+    )
+
+    with patch(
+        "admin.integrations.models.Integration.run_request",
+        Mock(
+            side_effect=(
+                # first call
+                [
+                    True,
+                    Mock(json=lambda: {"status": "not_done"}),
+                ],
+                # second call
+                [
+                    True,
+                    Mock(json=lambda: {"status": "not_done"}),
+                ],
+                # third call
+                [
+                    True,
+                    Mock(json=lambda: {"status": "not_done"}),
+                ],
+                # fourth call (will never reach this)
+                [
+                    True,
+                    Mock(json=lambda: {"status": "done"}),
+                ],
+            )
+        ),
+    ) as request_mock:
+        success, _response = integration.execute(new_hire, {})
+
+    assert request_mock.call_count == 3
+    assert success is False
+
+
+@pytest.mark.django_db
+@patch(
+    "requests.request",
+    Mock(return_value=Mock(status_code=200, content=b"0123456", json=lambda: dict({}))),
+)
+@patch(
+    "requests.request",
+    Mock(return_value=Mock(status_code=201, json=lambda: dict({}))),
+)
+def test_receiving_and_sending_file(new_hire_factory, custom_integration_factory):
+    new_hire = new_hire_factory()
+
+    integration = custom_integration_factory(
+        manifest={
+            "execute": [
+                {
+                    "url": "http://localhost/",
+                    "method": "GET",
+                    "save_as_file": "test.png",
+                },
+                {
+                    "url": "http://localhost/",
+                    "method": "POST",
+                    "files": {"file": "test.png"},
+                },
+            ]
+        }
+    )
+
+    success, _response = integration.execute(new_hire, {})
+
+    assert success is True
+
+
+@pytest.mark.django_db
+@patch(
+    "requests.request",
+    Mock(return_value=Mock(status_code=200, content=b"0123456", json=lambda: dict({}))),
+)
+@patch(
+    "requests.request",
+    Mock(return_value=Mock(status_code=201, json=lambda: dict({}))),
+)
+def test_receiving_and_sending_file_invalid_lookup(
+    new_hire_factory, custom_integration_factory
+):
+    new_hire = new_hire_factory()
+
+    integration = custom_integration_factory(
+        manifest={
+            "execute": [
+                {
+                    "url": "http://localhost/",
+                    "method": "GET",
+                    "save_as_file": "test.png",
+                },
+                {
+                    "url": "http://localhost/",
+                    "method": "POST",
+                    "files": {"file": "test124.png"},
+                },
+            ]
+        }
+    )
+
+    success, response = integration.execute(new_hire, {})
+
+    assert success is False
+    assert response == "test124.png could not be found in the locally saved files"
+
+
+@pytest.mark.django_db
+@patch(
+    "admin.integrations.models.Integration.run_request",
+    Mock(
+        side_effect=(
+            # first call
+            [
+                True,
+                Mock(json=lambda: {"status": "not_done"}),
+            ],
+            # second call
+            [
+                True,
+                Mock(json=lambda: {"status": "done"}),
+            ],
+        )
+    ),
+)
+def test_polling_getting_correct_state(new_hire_factory, custom_integration_factory):
+    new_hire = new_hire_factory()
+
+    integration = custom_integration_factory(
+        manifest={
+            "execute": [
+                {
+                    "url": "http://localhost/",
+                    "polling": {
+                        # very small number to not let task hang too long
+                        "interval": 0.1,
+                        "amount": 3,
+                    },
+                    "continue_if": {
+                        "response_notation": "status",
+                        "value": "done",
+                    },
+                }
+            ]
+        }
+    )
+
+    success, _response = integration.execute(new_hire, {})
+
+    assert success is True
+
+
+@pytest.mark.django_db
+@patch(
+    "admin.integrations.models.Integration.run_request",
+    Mock(return_value=(True, Mock(json=lambda: {"status": "not_done"}))),
+)
+def test_block_integration_on_condition(new_hire_factory, custom_integration_factory):
+    new_hire = new_hire_factory()
+
+    integration = custom_integration_factory(
+        manifest={
+            "execute": [
+                {
+                    "url": "http://localhost/",
+                    "continue_if": {
+                        "response_notation": "status",
+                        "value": "done",
+                    },
+                }
+            ]
+        }
+    )
+
+    success, _response = integration.execute(new_hire, {})
+
+    assert success is False
+
+
+@pytest.mark.django_db
+@patch(
+    "admin.integrations.models.Integration.run_request",
+    Mock(return_value=(True, Mock(json=lambda: {"details": "DOSOMETHING#"}))),
+)
+def test_integration_reuse_data_from_previous_request(
+    client, django_user_model, new_hire_factory, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory(
+        manifest={
+            "execute": [{"url": "http://localhost/", "method": "POST"}],
+        },
+    )
+    new_hire = new_hire_factory()
+    integration.execute(new_hire, {})
+    assert integration.params["responses"] == [{"details": "DOSOMETHING#"}]
+
+    assert (
+        integration._replace_vars("test {{responses.0.details}}") == "test DOSOMETHING#"
+    )
+
+
+@pytest.mark.django_db
+@patch(
+    "admin.integrations.models.Integration.run_request",
+    Mock(
+        return_value=(
+            True,
+            Mock(
+                json=lambda: [
+                    {"email": "test1@chiefonboarding.com", "external_id": 123},
+                    {"email": "test2@chiefonboarding.com", "external_id": 344},
+                    {"email": "test3@chiefonboarding.com", "external_id": 334},
+                    {"email": "test4@chiefonboarding.com", "external_id": 335},
+                    {"email": "test5@chiefonboarding.com"},
+                ]
+            ),
+        )
+    ),
+)
+def test_integration_sync_data(new_hire_factory, custom_integration_factory):
+    new_hire1 = new_hire_factory(email="test1@chiefonboarding.com")
+    new_hire2 = new_hire_factory(email="test2@chiefonboarding.com")
+    new_hire3 = new_hire_factory(email="test5@chiefonboarding.com")
+    new_hire4 = new_hire_factory(email="test6@chiefonboarding.com")
+
+    assert new_hire1.extra_fields == {}
+    assert new_hire2.extra_fields == {}
+    assert new_hire3.extra_fields == {}
+    assert new_hire4.extra_fields == {}
+
+    integration = custom_integration_factory(
+        manifest_type=Integration.ManifestType.SYNC_USERS,
+        manifest={
+            "execute": [
+                {
+                    "url": "http://localhost/",
+                }
+            ],
+            "data_from": "",
+            "action": "update",
+            "data_structure": {"email": "email", "EXT_ID": "external_id"},
+        },
+    )
+
+    SyncUsers(integration).run()
+
+    new_hire1.refresh_from_db()
+    assert new_hire1.extra_fields == {"EXT_ID": 123}
+
+    new_hire2.refresh_from_db()
+    assert new_hire2.extra_fields == {"EXT_ID": 344}
+
+    # no `external_id` data, so blank
+    new_hire3.refresh_from_db()
+    assert new_hire3.extra_fields == {}
+
+    # not in dataset from the API
+    new_hire4.refresh_from_db()
+    assert new_hire4.extra_fields == {}
+
+
+@pytest.mark.django_db
+@patch(
+    "admin.integrations.models.Integration.run_request",
+    Mock(
+        return_value=(
+            True,
+            Mock(
+                json=lambda: [
+                    {
+                        "email": "test1@chiefonboarding.com",
+                        "firstName": "test1",
+                        "lastName": "1",
+                    },
+                    {
+                        "email": "test2@chiefonboarding.com",
+                        "firstName": "test2",
+                        "lastName": "2",
+                    },
+                    {
+                        "email": "test3@chiefonboarding.com",
+                        "firstName": "test3",
+                        "lastName": "3",
+                    },
+                    {
+                        "email": "test4@chiefonboarding.com",
+                        "firstName": "test4",
+                        "lastName": "4",
+                    },
+                    {"email": "test5@chiefonboarding.com"},
+                ]
+            ),
+        )
+    ),
+)
+def test_integration_sync_data_create_users(
+    new_hire_factory, custom_integration_factory
+):
+    new_hire1 = new_hire_factory(email="test1@chiefonboarding.com")
+
+    assert new_hire1.extra_fields == {}
+
+    integration = custom_integration_factory(
+        manifest_type=Integration.ManifestType.SYNC_USERS,
+        manifest={
+            "execute": [
+                {
+                    "url": "http://localhost/",
+                }
+            ],
+            "data_from": "",
+            "action": "create",
+            "data_structure": {
+                "first_name": "firstName",
+                "last_name": "lastName",
+                "email": "email",
+            },
+        },
+    )
+
+    SyncUsers(integration).run()
+
+    new_hire1.refresh_from_db()
+    # didn't do anything with newhire1 as it only creates users
+    assert new_hire1.extra_fields == {}
+
+    assert get_user_model().objects.all().count() == 4
+    # randomly checking users to make sure their data is correct
+    assert get_user_model().objects.filter(email="test2@chiefonboarding.com").exists()
+    assert (
+        get_user_model().objects.get(email="test3@chiefonboarding.com").first_name
+        == "test3"
+    )
+    assert (
+        get_user_model().objects.get(email="test4@chiefonboarding.com").last_name == "4"
+    )
+    assert (
+        not get_user_model().objects.filter(email="test5@chiefonboarding.com").exists()
+    )
+
+
+@pytest.mark.django_db
+def test_integration_tracker(
+    client, django_user_model, new_hire_factory, custom_integration_factory
+):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.ADMIN)
+    )
+    integration = custom_integration_factory()
+    integration.manifest["exists"] = {
+        "url": "http://localhost:8000/test",
+        "method": "GET",
+        "expected": "{{ email}}",
+    }
+    integration.manifest["form"] = []
+    integration.manifest["extra_user_info"] = []
+    integration.save()
+    new_hire = new_hire_factory()
+
+    # Didn't find user
+    with patch(
+        "requests.request",
+        Mock(
+            return_value=Mock(
+                status_code=200,
+                json=lambda: '[{"error": "not_found"}]',
+                text='[{"error": "not_found"}]',
+            )
+        ),
+    ):
+        url = reverse(
+            "people:user_check_integration", args=[new_hire.id, integration.id]
+        )
+        response = client.get(url)
+
+    url = reverse("integrations:trackers")
+    response = client.get(url)
+
+    assert "All integration runs" in response.content.decode()
+    assert new_hire.full_name in response.content.decode()
+    assert "Check if user exists" in response.content.decode()
+
+    url = reverse("integrations:tracker", args=[IntegrationTracker.objects.first().id])
+    response = client.get(url)
+
+    assert integration.name + " for " + new_hire.full_name in response.content.decode()
+    assert "not_found" in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_access_report_view_permissions(client, django_user_model):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.NEWHIRE)
+    )
+    url = reverse("integrations:access-report")
+    response = client.get(url)
+
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_access_report_view_manager_can_access(client, manager_factory):
+    client.force_login(manager_factory())
+    url = reverse("integrations:access-report")
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert "Integration access report" in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_access_report_view_statuses(
+    client,
+    admin_factory,
+    new_hire_factory,
+    custom_integration_factory,
+    manual_user_provision_integration_factory,
+):
+    client.force_login(admin_factory())
+
+    # webhook integration with an `exists` block is included in
+    # `account_provision_options`
+    webhook_integration = custom_integration_factory(name="B")
+    manual_integration = manual_user_provision_integration_factory(name="A")
+
+    active_user = new_hire_factory()
+    revoked_user = new_hire_factory()
+    updating_user = new_hire_factory()
+    unknown_user = new_hire_factory()
+
+    IntegrationUser.objects.create(
+        user=active_user, integration=webhook_integration, revoked=False
+    )
+    IntegrationUser.objects.create(
+        user=revoked_user, integration=webhook_integration, revoked=True
+    )
+    IntegrationUser.objects.create(
+        user=updating_user, integration=webhook_integration, updating=True
+    )
+    # unknown_user never got an IntegrationUser record
+
+    url = reverse("integrations:access-report")
+    response = client.get(url)
+    content = response.content.decode()
+
+    assert response.status_code == 200
+    assert webhook_integration.name in content
+    assert manual_integration.name in content
+
+    # Only the row of the user that is still updating polls
+    assert content.count('hx-trigger="every 2s"') == 1
+    # The rendered column ids (ordered by name) are pinned in the poll url
+    poll_url = reverse("integrations:access-report-poll", args=[updating_user.id])
+    assert (
+        f"{poll_url}?integrations={manual_integration.id},{webhook_integration.id}"
+        in content
+    )
+    assert active_user.full_name in content
+    assert revoked_user.full_name in content
+    assert unknown_user.full_name in content
+
+
+@pytest.mark.django_db
+def test_access_report_view_csv_export(
+    client, admin_factory, new_hire_factory, custom_integration_factory
+):
+    client.force_login(admin_factory())
+    integration = custom_integration_factory()
+    user = new_hire_factory()
+    IntegrationUser.objects.create(user=user, integration=integration, revoked=False)
+
+    url = reverse("integrations:access-report")
+    response = client.get(url, {"format": "csv"})
+
+    assert response.status_code == 200
+    assert response["Content-Type"] == "text/csv"
+    assert (
+        response["Content-Disposition"]
+        == 'attachment; filename="integration-access-report.csv"'
+    )
+
+    content = response.content.decode()
+    assert "Name,Email," + integration.name in content
+    assert f"{user.full_name},{user.email},Active" in content
+
+
+@pytest.mark.django_db
+def test_access_report_refresh_view_permissions(
+    client, django_user_model, manager_factory
+):
+    client.force_login(manager_factory())
+    url = reverse("integrations:access-report-refresh")
+    response = client.post(url, follow=True)
+
+    # manager is not allowed, only admins are
+    assert response.status_code == 403
+
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.NEWHIRE)
+    )
+    response = client.post(url, follow=True)
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_access_report_refresh_view(
+    client,
+    admin_factory,
+    new_hire_factory,
+    custom_integration_factory,
+    manual_user_provision_integration_factory,
+):
+    admin = admin_factory()
+    client.force_login(admin)
+
+    webhook_integration = custom_integration_factory()
+    # manual provisioning integrations should be excluded from the refresh
+    manual_integration = manual_user_provision_integration_factory()
+    new_hire = new_hire_factory()
+
+    url = reverse("integrations:access-report-refresh")
+    with patch("admin.integrations.views.async_task") as mocked_async_task:
+        response = client.post(url, follow=True)
+
+    mocked_async_task.assert_called_once_with(
+        "admin.integrations.tasks.refresh_access_report",
+        task_name="Refresh access report",
+    )
+
+    assert reverse("integrations:access-report") in response.redirect_chain[-1][0]
+    assert "Refreshing access data in the background." in response.content.decode()
+
+    # IntegrationUser objects got created (with `updating=True`) for every user
+    # and every account-provisioning integration, except the manual ones
+    assert (
+        IntegrationUser.objects.filter(
+            integration=webhook_integration, updating=True
+        ).count()
+        == get_user_model().objects.count()
+    )
+    assert not IntegrationUser.objects.filter(integration=manual_integration).exists()
+    assert IntegrationUser.objects.filter(
+        integration=webhook_integration, user=admin
+    ).exists()
+    assert IntegrationUser.objects.filter(
+        integration=webhook_integration, user=new_hire
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_access_report_refresh_view_marks_existing_records_as_updating(
+    client, admin_factory, new_hire_factory, custom_integration_factory
+):
+    client.force_login(admin_factory())
+    integration = custom_integration_factory()
+    user = new_hire_factory()
+    existing = IntegrationUser.objects.create(
+        user=user, integration=integration, revoked=True, updating=False
+    )
+
+    url = reverse("integrations:access-report-refresh")
+    with patch("admin.integrations.views.async_task"):
+        client.post(url, follow=True)
+
+    existing.refresh_from_db()
+    assert existing.updating is True
+    # `bulk_create(..., ignore_conflicts=True)` should not have created a
+    # duplicate for the existing user/integration combination
+    assert (
+        IntegrationUser.objects.filter(user=user, integration=integration).count() == 1
+    )
+
+
+@pytest.mark.django_db
+def test_access_report_poll_view_permissions(client, django_user_model):
+    client.force_login(
+        django_user_model.objects.create(role=get_user_model().Role.NEWHIRE)
+    )
+    url = reverse("integrations:access-report-poll", args=[1])
+    response = client.get(url)
+
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_access_report_poll_view_unknown_user(client, manager_factory):
+    client.force_login(manager_factory())
+
+    url = reverse("integrations:access-report-poll", args=[999])
+    response = client.get(url)
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_access_report_poll_view_no_record(
+    client, manager_factory, new_hire_factory, custom_integration_factory
+):
+    manager = manager_factory()
+    client.force_login(manager)
+    integration = custom_integration_factory()
+    user = new_hire_factory(manager=manager)
+
+    url = reverse("integrations:access-report-poll", args=[user.id])
+    response = client.get(url, {"integrations": str(integration.id)})
+
+    assert response.status_code == 286
+    assert "—" in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_access_report_poll_view_still_updating(
+    client, manager_factory, new_hire_factory, custom_integration_factory
+):
+    manager = manager_factory()
+    client.force_login(manager)
+    integration1 = custom_integration_factory(name="A")
+    integration2 = custom_integration_factory(name="B")
+    user = new_hire_factory(manager=manager)
+    IntegrationUser.objects.create(
+        user=user, integration=integration1, updating=False, revoked=False
+    )
+    IntegrationUser.objects.create(user=user, integration=integration2, updating=True)
+
+    ids = f"{integration1.id},{integration2.id}"
+    url = reverse("integrations:access-report-poll", args=[user.id])
+    response = client.get(url, {"integrations": ids})
+    content = response.content.decode()
+
+    # Row keeps polling, but already finished cells are rendered
+    assert response.status_code == 200
+    assert "Active" in content
+    assert "spinner-border" in content
+    # Same columns are pinned for the next poll
+    assert f"{url}?integrations={ids}" in content
+    assert 'hx-trigger="every 2s"' in content
+
+
+@pytest.mark.django_db
+def test_access_report_poll_view_all_completed(
+    client, manager_factory, new_hire_factory, custom_integration_factory
+):
+    manager = manager_factory()
+    client.force_login(manager)
+    integration1 = custom_integration_factory(name="A")
+    integration2 = custom_integration_factory(name="B")
+    user = new_hire_factory(manager=manager)
+    IntegrationUser.objects.create(
+        user=user, integration=integration1, updating=False, revoked=False
+    )
+    IntegrationUser.objects.create(
+        user=user, integration=integration2, updating=False, revoked=True
+    )
+
+    url = reverse("integrations:access-report-poll", args=[user.id])
+    response = client.get(url, {"integrations": f"{integration1.id},{integration2.id}"})
+    content = response.content.decode()
+
+    assert response.status_code == 286
+    assert "Active" in content
+    assert "Not Active" in content
+    assert "spinner-border" not in content
+    assert "hx-get" not in content
+
+
+def _poll_row_cells(content):
+    # Contents of every cell, skipping the first (user) cell
+    cells = re.findall(r"<td[^>]*>(.*?)</td>", content, re.S)[1:]
+    return [
+        "Not Active"
+        if "Not Active" in cell
+        else "Active"
+        if "Active" in cell
+        else "Updating"
+        if "spinner-border" in cell
+        else "—"
+        for cell in cells
+    ]
+
+
+@pytest.mark.django_db
+def test_access_report_poll_view_keeps_rendered_column_order(
+    client, admin_factory, new_hire_factory, custom_integration_factory
+):
+    client.force_login(admin_factory())
+    integration_a = custom_integration_factory(name="A")
+    integration_b = custom_integration_factory(name="B")
+    integration_c = custom_integration_factory(name="C")
+    user = new_hire_factory()
+    IntegrationUser.objects.create(
+        user=user, integration=integration_a, updating=False, revoked=False
+    )
+    IntegrationUser.objects.create(
+        user=user, integration=integration_b, updating=False, revoked=True
+    )
+    IntegrationUser.objects.create(user=user, integration=integration_c, updating=True)
+
+    # Columns as initially rendered: A, B, C
+    ids = f"{integration_a.id},{integration_b.id},{integration_c.id}"
+
+    # While polling: A gets renamed (would now sort last), B gets deleted and a
+    # new integration is added that would sort first
+    integration_a.name = "Z"
+    integration_a.save()
+    integration_b.delete()
+    new_integration = custom_integration_factory(name="0")
+    IntegrationUser.objects.create(
+        user=user, integration=new_integration, updating=False, revoked=False
+    )
+
+    url = reverse("integrations:access-report-poll", args=[user.id])
+    response = client.get(url, {"integrations": ids})
+    content = response.content.decode()
+
+    # Cells still line up with the original A, B, C headers; the deleted
+    # integration gets a placeholder and the new one is left out
+    assert response.status_code == 200
+    assert _poll_row_cells(content) == ["Active", "—", "Updating"]
+    assert f"{url}?integrations={ids}" in content
+
+
+@pytest.mark.django_db
+def test_access_report_poll_view_invalid_integrations_param(
+    client, admin_factory, new_hire_factory
+):
+    client.force_login(admin_factory())
+    user = new_hire_factory()
+
+    url = reverse("integrations:access-report-poll", args=[user.id])
+    response = client.get(url, {"integrations": "1,abc"})
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_access_report_view_manager_only_sees_own_new_hires(
+    client, manager_factory, new_hire_factory, custom_integration_factory
+):
+    manager = manager_factory()
+    client.force_login(manager)
+    custom_integration_factory()
+
+    own_new_hire = new_hire_factory(manager=manager)
+    other_new_hire = new_hire_factory()
+
+    url = reverse("integrations:access-report")
+    response = client.get(url)
+    content = response.content.decode()
+
+    assert response.status_code == 200
+    assert [row["user"] for row in response.context["rows"]] == [own_new_hire]
+    assert own_new_hire.full_name in content
+    assert other_new_hire.full_name not in content
+
+    # CSV export is filtered as well
+    response = client.get(url, {"format": "csv"})
+    content = response.content.decode()
+
+    assert own_new_hire.email in content
+    assert other_new_hire.email not in content
+
+
+@pytest.mark.django_db
+def test_access_report_poll_view_manager_other_new_hire(
+    client, manager_factory, new_hire_factory, custom_integration_factory
+):
+    client.force_login(manager_factory())
+    integration = custom_integration_factory()
+    other_new_hire = new_hire_factory()
+    IntegrationUser.objects.create(
+        user=other_new_hire, integration=integration, updating=False, revoked=False
+    )
+
+    url = reverse("integrations:access-report-poll", args=[other_new_hire.id])
+    response = client.get(url)
+
+    # Status is not exposed
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_integration_tracker_list_manager_only_sees_own_new_hires(
+    client, manager_factory, new_hire_factory, custom_integration_factory
+):
+    manager = manager_factory()
+    client.force_login(manager)
+    integration = custom_integration_factory()
+
+    own_new_hire = new_hire_factory(manager=manager)
+    other_new_hire = new_hire_factory()
+
+    IntegrationTracker.objects.create(
+        integration=integration,
+        category=IntegrationTracker.Category.EXISTS,
+        for_user=own_new_hire,
+    )
+    IntegrationTracker.objects.create(
+        integration=integration,
+        category=IntegrationTracker.Category.EXISTS,
+        for_user=other_new_hire,
+    )
+
+    url = reverse("integrations:trackers")
+    response = client.get(url)
+
+    assert response.status_code == 200
+    assert list(response.context["object_list"].values_list("for_user", flat=True)) == [
+        own_new_hire.id
+    ]
+    assert own_new_hire.full_name in response.content.decode()
+    assert other_new_hire.full_name not in response.content.decode()
+
+
+@pytest.mark.django_db
+def test_integration_tracker_detail_manager_only_sees_own_new_hires(
+    client, manager_factory, new_hire_factory, custom_integration_factory
+):
+    manager = manager_factory()
+    client.force_login(manager)
+    integration = custom_integration_factory()
+
+    own_new_hire = new_hire_factory(manager=manager)
+    other_new_hire = new_hire_factory()
+
+    own_tracker = IntegrationTracker.objects.create(
+        integration=integration,
+        category=IntegrationTracker.Category.EXISTS,
+        for_user=own_new_hire,
+    )
+    other_tracker = IntegrationTracker.objects.create(
+        integration=integration,
+        category=IntegrationTracker.Category.EXISTS,
+        for_user=other_new_hire,
+    )
+
+    # Tracker of a new hire not managed by this manager
+    url = reverse("integrations:tracker", args=[other_tracker.id])
+    response = client.get(url)
+    assert response.status_code == 404
+
+    # Tracker of a new hire managed by this manager
+    url = reverse("integrations:tracker", args=[own_tracker.id])
+    response = client.get(url)
+    assert response.status_code == 200
+    assert (
+        integration.name + " for " + own_new_hire.full_name in response.content.decode()
+    )
+
+
+@pytest.mark.django_db
+def test_builder_exists_saves_key_value_fields_as_object(
+    client, admin_factory, custom_integration_factory
+):
+    client.force_login(admin_factory())
+    integration = custom_integration_factory()
+
+    url = reverse("integrations:manifest-exists-update", args=[integration.id])
+    response = client.post(
+        url,
+        {
+            "url": "https://example.com/users/{{email}}",
+            "method": "GET",
+            "expected": "{{email}}",
+            "headers": json.dumps([{"key": "test", "value": "hi"}]),
+            "store_data": json.dumps([{"key": "external_id", "value": "id"}]),
+        },
+    )
+    assert response.status_code == 302
+
+    integration.refresh_from_db()
+    assert integration.manifest["exists"]["headers"] == {"test": "hi"}
+    assert integration.manifest["exists"]["store_data"] == {"external_id": "id"}
+
+    # When editing again, the widget gets the key/value list
+    response = client.get(url)
+    assert response.context["form"].initial["headers"] == [
+        {"key": "test", "value": "hi"}
+    ]
+    assert response.context["form"].initial["store_data"] == [
+        {"key": "external_id", "value": "id"}
+    ]
+    # Original manifest is untouched
+    integration.refresh_from_db()
+    assert integration.manifest["exists"]["headers"] == {"test": "hi"}
+
+
+@pytest.mark.django_db
+def test_builder_execute_saves_headers_as_object(
+    client, admin_factory, custom_integration_factory
+):
+    client.force_login(admin_factory())
+    integration = custom_integration_factory()
+    data = {
+        "url": "https://example.com/users",
+        "method": "POST",
+        "data": "{}",
+        "headers": json.dumps([{"key": "test", "value": "hi"}]),
+    }
+
+    url = reverse("integrations:manifest-execute-add", args=[integration.id])
+    response = client.post(url, data)
+    assert response.status_code == 302
+
+    integration.refresh_from_db()
+    assert integration.manifest["execute"][-1]["headers"] == {"test": "hi"}
+
+    index = len(integration.manifest["execute"]) - 1
+    url = reverse("integrations:manifest-execute-update", args=[integration.id, index])
+    data["headers"] = json.dumps([{"key": "test", "value": "updated"}])
+    response = client.post(url, data)
+    assert response.status_code == 200
+
+    integration.refresh_from_db()
+    assert integration.manifest["execute"][index]["headers"] == {"test": "updated"}
+
+
+@pytest.fixture
+def mock_integration_urls(settings):
+    import importlib
+
+    from django.urls import clear_url_caches
+
+    import back.urls
+
+    settings.TEST_INTEGRATIONS_ENDPOINT = True
+    importlib.reload(back.urls)
+    clear_url_caches()
+    yield
+    settings.TEST_INTEGRATIONS_ENDPOINT = False
+    importlib.reload(back.urls)
+    clear_url_caches()
+
+
+@pytest.mark.django_db
+def test_mock_integration_endpoint_not_routed_by_default(client):
+    response = client.get("/test-integrations/")
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_mock_integration_endpoint_view_disabled(rf, settings):
+    from django.http import Http404
+
+    from admin.integrations.mock_views import MockIntegrationView
+
+    settings.TEST_INTEGRATIONS_ENDPOINT = False
+    with pytest.raises(Http404):
+        MockIntegrationView.as_view()(rf.get("/test-integrations/"))
+
+
+@pytest.mark.django_db
+def test_mock_integration_endpoint_defaults(client, mock_integration_urls):
+    # No login needed
+    response = client.get("/test-integrations/")
+    assert response.status_code == 200
+    assert response["Content-Type"] == "application/json"
+    assert response.json() == {}
+
+
+@pytest.mark.django_db
+def test_mock_integration_endpoint_no_subpaths(client, mock_integration_urls):
+    response = client.get("/test-integrations/users")
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_mock_integration_endpoint_custom_response(client, mock_integration_urls):
+    response = client.post("/test-integrations/?status=201&body=" + '{"id": "abc"}')
+    assert response.status_code == 201
+    assert response.json() == {"id": "abc"}
+
+
+@pytest.mark.django_db
+def test_mock_integration_endpoint_content_type(client, mock_integration_urls):
+    response = client.delete(
+        "/test-integrations/?status=500&body=oops&content_type=text/plain"
+    )
+    assert response.status_code == 500
+    assert response["Content-Type"] == "text/plain"
+    assert response.content == b"oops"
+
+
+@pytest.mark.django_db
+@patch("admin.integrations.mock_views.time.sleep")
+def test_mock_integration_endpoint_delay(sleep, client, mock_integration_urls):
+    client.get("/test-integrations/?delay=2.5")
+    sleep.assert_called_once_with(2.5)
+
+    sleep.reset_mock()
+    client.get("/test-integrations/")
+    sleep.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_mock_integration_endpoint_echo(client, mock_integration_urls):
+    response = client.put(
+        "/test-integrations/?echo=true&status=202&body=ignored",
+        data=json.dumps({"name": "x"}),
+        content_type="application/json",
+    )
+    assert response.status_code == 202
+    assert response["Content-Type"] == "application/json"
+    data = response.json()
+    assert data["method"] == "PUT"
+    assert data["query"] == {"echo": ["true"], "status": ["202"], "body": ["ignored"]}
+    assert json.loads(data["body"]) == {"name": "x"}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "query",
+    ["status=abc", "status=99", "status=600", "delay=abc", "delay=-1", "delay=10.1"],
+)
+def test_mock_integration_endpoint_invalid_params(query, client, mock_integration_urls):
+    response = client.get(f"/test-integrations/?{query}")
+    assert response.status_code == 400
